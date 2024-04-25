@@ -28,17 +28,13 @@ void VectorAdd_tbb(const IntVector &a_vector, const IntVector &b_vector,
         tbb::parallel_for(tbb::blocked_range<int>(0, sum_parallel.size()),
             [&](tbb::blocked_range<int> r)
             {
+                #pragma omp simd
                 for (int j = r.begin(); j < r.end(); ++j)
                 {
                     sum_parallel[j] = a_vector[j] + b_vector[j];
                 }
-            }, tbb::static_partitioner());
-            
-            // Implicit barrier 
-           // loop 2
-        tbb::parallel_for(tbb::blocked_range<int>(0, sum_parallel.size()),
-            [&](tbb::blocked_range<int> r)
-            {
+                // Implicit barrier
+                #pragma omp simd
                 for (int j = r.begin(); j < r.end(); ++j)
                 {
                     sum_parallel[j] = 5*sum_parallel[j];
@@ -46,6 +42,95 @@ void VectorAdd_tbb(const IntVector &a_vector, const IntVector &b_vector,
             }, tbb::static_partitioner());
     });
 }
+
+//************************************
+// Vector add in TBB using fixed threads in arena using task group".
+//************************************
+
+void VectorAdd_tbb_new_proposal_task_grp(const IntVector &a_vector, const IntVector &b_vector,
+               IntVector &sum_parallel) {
+    // A workgroup is executed by 8 tbb thread in a fixed-size arena
+    // 8 workgoups concurrently executed at maximum
+    // subgroup size is 16 (SIMD - Platform specific)
+    oneapi::tbb::global_control c(tbb::global_control::max_allowed_parallelism, 64);
+    const int numThreads= 8;
+    const int numArenas = 8;
+    std::vector<oneapi::tbb::task_arena> arenas(numArenas);
+    std::vector<oneapi::tbb::task_group> task_groups(numArenas);
+    //barriers are not copyable
+    std::vector<std::barrier<> * > arena_barriers;
+
+    // Initialize the arenas.
+    arenas[0].initialize(numThreads, 1);
+    arena_barriers.emplace_back(new std::barrier(numThreads));
+    for (int i = 1; i < numArenas; i++) {
+        arenas[i].initialize(numThreads, 0);
+        arena_barriers.emplace_back(new std::barrier(numThreads));
+    }
+    auto total_wgs = sum_parallel.size()/128; // 128 is the workgroup size
+    for (int wg =0; wg <total_wgs; wg+=numArenas) {
+        for (int r_wg = 0; r_wg <  numArenas; r_wg++) {
+            if (r_wg == 0) {
+              arenas[r_wg].execute([&, r_wg] {
+                task_groups[r_wg].run([&, r_wg] () {
+                    // Each workgroup is executed in an arena
+                    // and execute 8 subgroups concurrently
+                    // r_wg is of size 1
+                    tbb::parallel_for(0, 8, [&](int r_subgrp) {
+                        // r_subgrp is of size 1
+                        auto idx_offset = (wg + r_wg)*128 + r_subgrp*16;
+                        #pragma omp simd
+                        for (int j = 0; j < 16; ++j)
+                        {
+                            auto idx = idx_offset + j;
+                            sum_parallel[idx_offset + j] = a_vector[idx_offset + j] +
+                            b_vector[idx_offset + j];
+                        }
+                        arena_barriers[r_wg]->arrive_and_wait();
+                        #pragma omp simd
+                        for (int j = 0; j < 16; ++j)
+                        {
+                            sum_parallel[idx_offset + j] = 5*sum_parallel[idx_offset + j];
+                        }
+                    }, tbb::static_partitioner());
+                });
+            });
+            } else {
+                arenas[r_wg].enqueue([&, r_wg] {
+                    task_groups[r_wg].run([&, r_wg] () {
+                        // Each workgroup is executed in an arena
+                        // and execute 8 subgroups concurrently
+                        // r_wg is of size 1
+                        tbb::parallel_for(0, 8, [&](int r_subgrp) {
+                            // r_subgrp is of size 1
+                            auto idx_offset = (wg + r_wg)*128 + r_subgrp*16;
+                            #pragma omp simd
+                            for (int j = 0; j < 16; ++j)
+                            {
+                                auto idx = idx_offset + j;
+                                sum_parallel[idx_offset + j] = a_vector[idx_offset + j] +
+                                b_vector[idx_offset + j];
+                            }
+                            arena_barriers[r_wg]->arrive_and_wait();
+                            #pragma omp simd
+                            for (int j = 0; j < 16; ++j)
+                            {
+                                sum_parallel[idx_offset + j] = 5*sum_parallel[idx_offset + j];
+                            }
+                        }, tbb::static_partitioner());
+                    });
+                });
+            }
+        }
+        // wait for all task
+        for (int i = 0; i<numArenas; i++) {
+          arenas[i].execute([&] {
+            task_groups[i].wait();
+          });
+        }
+    }
+}
+
 
 //************************************
 // Vector add in TBB using fixed threads in arena".
@@ -70,22 +155,21 @@ void VectorAdd_tbb_new_proposal(const IntVector &a_vector, const IntVector &b_ve
     }
     auto total_wgs = sum_parallel.size()/128; // 128 is the workgroup size
      // There are total 8 Workgroups each executed in a single fixed arena
+     tbb::task_arena outer_arena(8,1);
      for (int wg =0; wg <total_wgs; wg+=numArenas) {
-         
-        tbb::parallel_for(tbb::blocked_range<int>(0, numArenas),
-        [&](tbb::blocked_range<int> r_wg)
+     outer_arena.execute([&] {
+        tbb::parallel_for(0, numArenas,
+        [&](int r_wg)
         {
-                   for (int i = r_wg.begin(); i < r_wg.end(); ++i)
-                   {
-                        arenas[r_wg.begin()].execute([&] {
+                        arenas[r_wg].execute([&] {
                             // Each workgroup is executed in an arena
                             // and execute 8 subgroups concurrently
                             // r_wg is of size 1
-                            tbb::parallel_for(tbb::blocked_range<int>(0, 8),
-                                [&](tbb::blocked_range<int> r_subgrp)
+                            tbb::parallel_for(0, 8,
+                                [&](int r_subgrp)
                                 {
                                     // r_subgrp is of size 1
-                                    auto idx_offset = (wg + r_wg.begin())*128 + r_subgrp.begin()*16;
+                                    auto idx_offset = (wg + r_wg)*128 + r_subgrp*16;
                                     #pragma omp simd
                                     for (int j = 0; j < 16; ++j)
                                     {
@@ -93,7 +177,7 @@ void VectorAdd_tbb_new_proposal(const IntVector &a_vector, const IntVector &b_ve
                                         sum_parallel[idx_offset + j] = a_vector[idx_offset + j] +
                                         b_vector[idx_offset + j];
                                     }
-                                    arena_barriers[i]->arrive_and_wait();
+                                    arena_barriers[r_wg]->arrive_and_wait();
                                     #pragma omp simd
                                     for (int j = 0; j < 16; ++j)
                                     {
@@ -101,8 +185,8 @@ void VectorAdd_tbb_new_proposal(const IntVector &a_vector, const IntVector &b_ve
                                     }
                                 }, tbb::static_partitioner());
                         });
-                   }
         }, tbb::static_partitioner());
+     });
      }
 }
 
@@ -176,10 +260,10 @@ static auto exception_handler = [](sycl::exception_list e_list) {
 int main(int argc, char* argv[]) {
     auto selector = cpu_selector_v;
     queue q(selector, exception_handler);
-    constexpr size_t N = 5120;
+    constexpr size_t N = 5120*128;
     IntVector a(N), b(N);
     IntVector sum_syclParallel(N), sum_tbbParallel(N),
-              sum_tbbParallel_nw_proposal(N), sum_sequential(N);
+              sum_tbbParallel_nw_proposal(N), sum_tbbParallel_nw_proposal_tg(N), sum_sequential(N);
     // fill a and b with random numbers in the unit interval
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -190,6 +274,7 @@ int main(int argc, char* argv[]) {
     std::fill(sum_syclParallel.begin(), sum_syclParallel.end(), 0.0);
     std::fill(sum_tbbParallel.begin(), sum_tbbParallel.end(), 0.0);
     std::fill(sum_tbbParallel_nw_proposal.begin(), sum_tbbParallel_nw_proposal.end(), 0.0);
+    std::fill(sum_tbbParallel_nw_proposal_tg.begin(), sum_tbbParallel_nw_proposal_tg.end(), 0.0);
         // Vector addition in SYCL
     VectorAdd_sycl(q, a, b, sum_syclParallel);
 
@@ -197,11 +282,20 @@ int main(int argc, char* argv[]) {
     VectorAdd_tbb(a, b, sum_tbbParallel);
     auto end_VectorAdd_tbb = std::chrono::steady_clock::now();
     std::chrono::duration<double> duration_VectorAdd_tbb = std::chrono::duration_cast<std::chrono::duration<double>>(end_VectorAdd_tbb - start_VectorAdd_tbb);
+    
+    std::cout << "The VectorAdd_tbb Finished! \n";
 
     auto start_VectorAdd_tbb_new_proposal = std::chrono::steady_clock::now();
     VectorAdd_tbb_new_proposal(a, b, sum_tbbParallel_nw_proposal);
     auto end_VectorAdd_tbb_new_proposal = std::chrono::steady_clock::now();
     std::chrono::duration<double> duration_VectorAdd_tbb_new_proposal = std::chrono::duration_cast<std::chrono::duration<double>>(end_VectorAdd_tbb_new_proposal - start_VectorAdd_tbb_new_proposal);
+
+    std::cout << "The VectorAdd_tbb_new_proposal Finished! \n";
+    auto start_VectorAdd_tbb_new_proposal_tg = std::chrono::steady_clock::now();
+    VectorAdd_tbb_new_proposal_task_grp(a, b, sum_tbbParallel_nw_proposal_tg);
+    auto end_VectorAdd_tbb_new_proposal_tg = std::chrono::steady_clock::now();
+    std::chrono::duration<double> duration_VectorAdd_tbb_new_proposal_tg = std::chrono::duration_cast<std::chrono::duration<double>>(end_VectorAdd_tbb_new_proposal_tg - start_VectorAdd_tbb_new_proposal_tg);
+     std::cout << "The VectorAdd_tbb_new_proposal_task_grp Finished! \n";
     
       // Compute the sum of two vectors in sequential for validation.
     for (size_t i = 0; i < sum_sequential.size(); i++) {
@@ -243,5 +337,6 @@ int main(int argc, char* argv[]) {
     std::cout << "Vector add Successful on TBB using Fixed Task arena.\n";
     std::cout << "The VectorAdd_tbb took: " << duration_VectorAdd_tbb.count() << std::endl;
     std::cout << "The VectorAdd_tbb_new_proposal took: " << duration_VectorAdd_tbb_new_proposal.count() << std::endl;
+    std::cout << "The VectorAdd_tbb_new_proposal_task_group took: " << duration_VectorAdd_tbb_new_proposal_tg.count() << std::endl;
     
 }
